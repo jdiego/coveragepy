@@ -5,11 +5,9 @@
 """XML reporting for coverage.py"""
 
 import os
-import os.path
 import sys
 import time
 import xml.dom.minidom
-import numpy as np
 from coverage import env
 from coverage import __url__, __version__, files
 from coverage.backward import iitems
@@ -108,6 +106,7 @@ class XmlReporter(object):
             modules_elts, lhits, lnum, bhits, bnum = pkg_data
             xpackage = self.xml_out.createElement("package")
             xpackages.appendChild(xpackage)
+
             xclasses = self.xml_out.createElement("classes")
             xpackage.appendChild(xclasses)
             #
@@ -120,6 +119,8 @@ class XmlReporter(object):
 
             xpackage.setAttribute("name", pkg_name.replace(os.sep, '.'))
             xpackage.setAttribute("line-rate", rate(lhits, lnum))
+            xpackage.setAttribute("hits", str(lhits))
+            xpackage.setAttribute("lines", str(lnum))
             branch_rate = rate(bhits, bnum) if has_arcs else "0"
             xpackage.setAttribute("branch-rate", branch_rate)
             xpackage.setAttribute("complexity", "0")
@@ -209,20 +210,15 @@ class XmlReporter(object):
 
     def set_class_stats(self, xclass, end_line, analysis):
         first_line = xclass.first_line
-        class_lines = end_line - first_line
         filtered = [smt for smt in analysis.statements if smt >=first_line and smt <=end_line]
-        class_hits = len(filtered)
-        xclass.setAttribute("class_lines", str(class_lines))
-        xclass.setAttribute("class_hits", str(class_hits))
+        class_lines = len(filtered)
+        xclass.setAttribute("lines", str(class_lines))
+        class_hits = 0
 
-
-        # if has_arcs:
-        #     class_branches = sum(t for t, k in branch_stats.values())
-        #     missing_branches = sum(t - k for t, k in branch_stats.values())
-        #     class_br_hits = class_branches - missing_branches
-        # else:
-        #     class_branches = 0.0
-        #     class_br_hits = 0.0
+        filtered_missing = [smt for smt in analysis.missing if smt >=first_line and smt <=end_line]
+        #
+        class_hits = class_lines - len(filtered_missing)
+        xclass.setAttribute("hits", str(class_hits))
 
         # Finalize the statistics that are collected in the XML DOM.
         xclass.setAttribute("line-rate", rate(class_hits, class_lines))
@@ -237,9 +233,9 @@ class XmlReporter(object):
                 method_misses += 1
         #
         method_lines = len(xmethod.childNodes)
-        xmethod.setAttribute("method_lines", str(method_lines))
-        xmethod.setAttribute("method_hits", str(method_hits))
-        xmethod.setAttribute("method_misses", str(method_misses))
+        xmethod.setAttribute("lines", str(method_lines))
+        xmethod.setAttribute("hits", str(method_hits))
+        xmethod.setAttribute("misses", str(method_misses))
 
     def process_class(self, rel_name, lineno, tokens, xclass, xmethod, analysis):
         found, name = self.process_tokens(tokens, "class")
@@ -261,7 +257,7 @@ class XmlReporter(object):
         #
         return False, xclass
 
-    def process_method(self, xmethod, tokens, xclass, free_fn):
+    def process_method(self, xmethod, tokens, xclass, free_fn, rel_name):
         found, method_name = self.process_tokens(tokens, "def")
         if found:
             #
@@ -270,11 +266,12 @@ class XmlReporter(object):
             #
             xmethod = self.xml_out.createElement("method")
             xmethod.setAttribute("name", method_name)
-
             if xclass and (self.is_member_fn(tokens) or self.is_class_level):
                 xclass.appendChild(xmethod)
                 self.is_class_level = False
             else:
+                filename = rel_name.replace("\\", "/")
+                xmethod.setAttribute("filename", filename)
                 free_fn.append(xmethod)
             return True, xmethod
         return False, xmethod
@@ -290,22 +287,26 @@ class XmlReporter(object):
         xline.setAttribute("number", str(line))
         # Q: can we get info about the number of times a statement is
         # executed?  If so, that should be recorded here.
-        xline.setAttribute("hits", str(int(line not in analysis.missing)))
+        is_hit = (line not in analysis.missing)
+        xline.setAttribute("hits", str(int(is_hit)))
         if has_arcs:
             if line in branch_stats:
                 total, taken = branch_stats[line]
                 xline.setAttribute("branch", "true")
-                xline.setAttribute("condition-coverage", "%d%% (%d/%d)" % (100*taken//total, taken, total))
+                xline.setAttribute(
+                    "condition-coverage",
+                    "%d%% (%d/%d)" % (100*taken//total, taken, total)
+                )
             if line in missing_branch_arcs:
                 annlines = ["exit" if b < 0 else str(b) for b in missing_branch_arcs[line]]
                 xline.setAttribute("missing-branches", ",".join(annlines))
         return xline
 
-
     def xml_file(self, fr, analysis, has_arcs):
         """Add to the XML report for a single file."""
         if self.config.skip_empty and analysis.numbers.n_statements == 0:
             return
+
         #
         dirname, rel_name = self.extract_names(fr)
         package = self.mount_package(dirname)
@@ -313,7 +314,7 @@ class XmlReporter(object):
         free_fn = []
 
         #
-        xclasses =[]
+        xclasses = []
         xclass, xmethod = None, None
         branch_stats = analysis.branch_stats()
         missing_branch_arcs = analysis.missing_branch_arcs()
@@ -321,6 +322,9 @@ class XmlReporter(object):
         line = 1
         self.is_class_level = False
         for line, tokens in enumerate(fr.source_token_lines(), start=1):
+            if line not in analysis.statements:
+                continue
+
             if tokens:
                 is_tag = self.is_property_tag(tokens)
                 if is_tag:
@@ -331,8 +335,10 @@ class XmlReporter(object):
                     xclasses.append(xclass)
                     continue
                 #
-                created, xmethod = self.process_method(xmethod, tokens, xclass, free_fn)
+                created, xmethod = self.process_method(xmethod, tokens, xclass, free_fn, rel_name)
                 if created:
+                    if not self.is_class_level and xclass:
+                        self.set_class_stats(xclass, line, analysis)
                     continue
                 #
                 # Processing a line
@@ -342,13 +348,11 @@ class XmlReporter(object):
                 elif xclass:
                     xclass.appendChild(xline)
         #
-        if xclass:
+        if xclass and self.is_class_level:
             self.set_class_stats(xclass, line, analysis)
         if xmethod:
             self.set_method_stats(xmethod)
 
-        #if xscope.hasChildNodes():
-        #    xclasses.append(xscope)
         # Rename
         package[0][rel_name] = (xclasses, free_fn)
         if has_arcs:
